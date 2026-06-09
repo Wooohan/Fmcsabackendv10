@@ -300,6 +300,58 @@ router.post('/subscribe-page', async (req, res) => {
 });
 
 /**
+ * Exchange a short-lived Facebook user token for a long-lived one,
+ * then retrieve page tokens (which never expire).
+ */
+router.post('/fb/exchange-token', async (req, res) => {
+  const { shortLivedToken } = req.body;
+  const appId = process.env.FB_APP_ID;
+  const appSecret = process.env.FB_APP_SECRET;
+
+  if (!appId || !appSecret) {
+    return res.status(500).json({ error: 'FB_APP_ID or FB_APP_SECRET not configured on server' });
+  }
+  if (!shortLivedToken) {
+    return res.status(400).json({ error: 'shortLivedToken is required' });
+  }
+
+  try {
+    // Step 1: Exchange short-lived user token for long-lived user token (~60 days)
+    const exchangeUrl = `https://graph.facebook.com/v22.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${appId}&client_secret=${appSecret}&fb_exchange_token=${shortLivedToken}`;
+    const exchangeRes = await fetch(exchangeUrl);
+    const exchangeData = await exchangeRes.json();
+
+    if (exchangeData.error) {
+      logger.error('Token exchange failed:', exchangeData.error);
+      return res.status(400).json({ error: exchangeData.error.message });
+    }
+
+    const longLivedUserToken = exchangeData.access_token;
+
+    // Step 2: Fetch page tokens using the long-lived user token.
+    // Page tokens obtained this way NEVER expire.
+    const pagesUrl = `https://graph.facebook.com/v22.0/me/accounts?access_token=${longLivedUserToken}`;
+    const pagesRes = await fetch(pagesUrl);
+    const pagesData = await pagesRes.json();
+
+    if (pagesData.error) {
+      logger.error('Failed to fetch pages with long-lived token:', pagesData.error);
+      return res.status(400).json({ error: pagesData.error.message });
+    }
+
+    logger.info(`Token exchange successful. Retrieved ${pagesData.data?.length || 0} pages with permanent tokens.`);
+    res.json({
+      pages: pagesData.data || [],
+      longLivedUserToken,
+      expiresIn: exchangeData.expires_in || null,
+    });
+  } catch (error) {
+    logger.error('Token exchange error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Public config — returns non-secret values the frontend may need
  */
 router.get('/config', (_req, res) => {
