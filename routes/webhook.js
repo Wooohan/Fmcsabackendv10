@@ -61,6 +61,11 @@ router.post('/', async (req, res) => {
 /**
  * Fetch the customer's name and profile picture from Facebook Graph API.
  * Uses the page access token stored in the DB for the given pageId.
+ * 
+ * Multiple strategies are attempted:
+ * 1. /{customerId}?fields=name,picture.type(large) — standard approach
+ * 2. /{customerId}/picture?access_token=... — direct picture redirect
+ * 3. /{conversationId}?fields=participants{name,picture.type(large)} — conversation participants
  */
 async function fetchCustomerProfile(customerId, pageId) {
   try {
@@ -71,19 +76,83 @@ async function fetchCustomerProfile(customerId, pageId) {
     }
 
     const accessToken = pageResult.rows[0].accessToken;
-    const url = `https://graph.facebook.com/v22.0/${customerId}?fields=name,picture.type(large)&access_token=${accessToken}`;
-    const response = await fetch(url);
-    const data = await response.json();
+    let name = `User ${customerId.substring(0, 8)}`;
+    let avatarUrl = '';
 
-    if (data.error) {
-      logger.warn('Failed to fetch customer profile:', data.error.message);
-      return { name: `User ${customerId.substring(0, 8)}`, avatarUrl: '' };
+    // Strategy 1: Standard fields-based approach
+    try {
+      const url = `https://graph.facebook.com/v22.0/${customerId}?fields=name,picture.type(large)&access_token=${accessToken}`;
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (!data.error) {
+        name = data.name || name;
+        avatarUrl = data.picture?.data?.url || '';
+      } else {
+        logger.warn(`Profile fetch (fields) failed for ${customerId}: [${data.error.code}] ${data.error.message}`);
+      }
+    } catch (e) {
+      logger.warn(`Profile fetch (fields) error for ${customerId}:`, e.message);
     }
 
-    return {
-      name: data.name || `User ${customerId.substring(0, 8)}`,
-      avatarUrl: data.picture?.data?.url || '',
-    };
+    // Strategy 2: Direct picture endpoint with token (if avatar still missing)
+    if (!avatarUrl) {
+      try {
+        const directPicUrl = `https://graph.facebook.com/v22.0/${customerId}/picture?type=large&width=200&height=200&access_token=${accessToken}`;
+        const directRes = await fetch(directPicUrl, { redirect: 'manual' });
+
+        if (directRes.status === 302 || directRes.status === 301) {
+          const redirectUrl = directRes.headers.get('location');
+          if (redirectUrl && !redirectUrl.includes('static.xx.fbcdn.net/rsrc.php')) {
+            avatarUrl = redirectUrl;
+          }
+        }
+      } catch (e) {
+        logger.warn(`Direct picture fetch error for ${customerId}:`, e.message);
+      }
+    }
+
+    // Strategy 3: Try conversation participants API (if avatar still missing)
+    if (!avatarUrl) {
+      try {
+        const convId = `${pageId}_${customerId}`;
+        const convUrl = `https://graph.facebook.com/v22.0/${convId}?fields=participants{name,picture.type(large)}&access_token=${accessToken}`;
+        const convRes = await fetch(convUrl);
+        const convData = await convRes.json();
+
+        if (!convData.error && convData.participants?.data) {
+          const customer = convData.participants.data.find(p => p.id !== pageId);
+          if (customer) {
+            name = customer.name || name;
+            avatarUrl = customer.picture?.data?.url || avatarUrl;
+          }
+        }
+      } catch (e) {
+        logger.warn(`Conversation participants fetch error for ${customerId}:`, e.message);
+      }
+    }
+
+    // Strategy 4: If name is still default, try to get at least the name from /me/conversations
+    if (name === `User ${customerId.substring(0, 8)}` && !avatarUrl) {
+      // As a last resort, try fetching conversations that include this user
+      try {
+        const searchUrl = `https://graph.facebook.com/v22.0/${pageId}/conversations?fields=participants{name}&user_id=${customerId}&access_token=${accessToken}`;
+        const searchRes = await fetch(searchUrl);
+        const searchData = await searchRes.json();
+
+        if (!searchData.error && searchData.data?.length > 0) {
+          const conv = searchData.data[0];
+          const customer = conv.participants?.data?.find(p => p.id !== pageId);
+          if (customer?.name) {
+            name = customer.name;
+          }
+        }
+      } catch (e) {
+        // Silent — we've exhausted all options
+      }
+    }
+
+    return { name, avatarUrl };
   } catch (err) {
     logger.warn('Error fetching customer profile:', err.message);
     return { name: `User ${customerId.substring(0, 8)}`, avatarUrl: '' };
