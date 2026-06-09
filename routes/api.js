@@ -361,6 +361,62 @@ router.get('/config', (_req, res) => {
 });
 
 /**
+ * Refresh avatars for conversations with missing profile pictures.
+ * Fetches fresh avatar URLs from Facebook Graph API using page access tokens.
+ */
+router.post('/refresh-avatars', async (req, res) => {
+  try {
+    // Find conversations with empty or null customerAvatar
+    const result = await query(
+      `SELECT c.id, c."customerId", c."pageId", c."customerName", p."accessToken"
+       FROM conversations c
+       JOIN pages p ON c."pageId" = p.id
+       WHERE (c."customerAvatar" IS NULL OR c."customerAvatar" = '')
+       AND p."accessToken" IS NOT NULL
+       LIMIT 50`
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ ok: true, updated: 0, message: 'All conversations already have avatars' });
+    }
+
+    let updatedCount = 0;
+
+    for (const row of result.rows) {
+      try {
+        const url = `https://graph.facebook.com/v22.0/${row.customerId}?fields=name,picture.type(large)&access_token=${row.accessToken}`;
+        const fbRes = await fetch(url);
+        const data = await fbRes.json();
+
+        if (data.error) {
+          logger.warn(`Avatar refresh failed for ${row.customerId}:`, data.error.message);
+          continue;
+        }
+
+        const avatarUrl = data.picture?.data?.url || '';
+        const customerName = data.name || row.customerName;
+
+        if (avatarUrl) {
+          await query(
+            `UPDATE conversations SET "customerAvatar" = $1, "customerName" = $2 WHERE id = $3`,
+            [avatarUrl, customerName, row.id]
+          );
+          updatedCount++;
+        }
+      } catch (err) {
+        logger.warn(`Avatar refresh error for ${row.customerId}:`, err.message);
+      }
+    }
+
+    logger.info(`Avatar refresh complete: ${updatedCount}/${result.rows.length} updated`);
+    res.json({ ok: true, updated: updatedCount, total: result.rows.length });
+  } catch (error) {
+    logger.error('Error refreshing avatars:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * API health check
  */
 router.get('/health', (_req, res) => {
