@@ -38,10 +38,30 @@ router.post('/db', async (req, res) => {
           return res.status(400).json({ error: 'Missing id in payload' });
         }
 
+        // JSONB columns that need explicit JSON.stringify + cast
+        const jsonbColumns = new Set(['assignedPageIds', 'assignedAgentIds']);
+
         const columns = Object.keys(payload);
-        const values = Object.values(payload);
-        const placeholders = columns.map((_, i) => `$${i + 1}`);
-        const updateSet = columns.map((col, i) => `"${col}" = $${i + 1}`).join(', ');
+        // Serialize arrays/objects for JSONB columns so node-pg doesn't
+        // convert them to PostgreSQL array literals
+        const values = columns.map((col) => {
+          const val = payload[col];
+          if (jsonbColumns.has(col)) {
+            // Always store as JSON string for JSONB columns
+            if (val === null || val === undefined) return '[]';
+            return JSON.stringify(val);
+          }
+          return val;
+        });
+
+        const placeholders = columns.map((col, i) => {
+          if (jsonbColumns.has(col)) return `$${i + 1}::jsonb`;
+          return `$${i + 1}`;
+        });
+        const updateSet = columns.map((col, i) => {
+          if (jsonbColumns.has(col)) return `"${col}" = $${i + 1}::jsonb`;
+          return `"${col}" = $${i + 1}`;
+        }).join(', ');
 
         const sql = `
           INSERT INTO "${table}" (${columns.map(c => `"${c}"`).join(', ')})
