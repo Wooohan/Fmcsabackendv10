@@ -58,6 +58,38 @@ router.post('/', async (req, res) => {
   }
 });
 
+/**
+ * Fetch the customer's name and profile picture from Facebook Graph API.
+ * Uses the page access token stored in the DB for the given pageId.
+ */
+async function fetchCustomerProfile(customerId, pageId) {
+  try {
+    // Get the page's access token from DB
+    const pageResult = await query(`SELECT "accessToken" FROM pages WHERE id = $1`, [pageId]);
+    if (pageResult.rows.length === 0 || !pageResult.rows[0].accessToken) {
+      return { name: `User ${customerId.substring(0, 8)}`, avatarUrl: '' };
+    }
+
+    const accessToken = pageResult.rows[0].accessToken;
+    const url = `https://graph.facebook.com/v22.0/${customerId}?fields=name,picture.type(large)&access_token=${accessToken}`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.error) {
+      logger.warn('Failed to fetch customer profile:', data.error.message);
+      return { name: `User ${customerId.substring(0, 8)}`, avatarUrl: '' };
+    }
+
+    return {
+      name: data.name || `User ${customerId.substring(0, 8)}`,
+      avatarUrl: data.picture?.data?.url || '',
+    };
+  } catch (err) {
+    logger.warn('Error fetching customer profile:', err.message);
+    return { name: `User ${customerId.substring(0, 8)}`, avatarUrl: '' };
+  }
+}
+
 async function handleMessage(event, pageId, senderId, io) {
   const message = event.message;
   if (!message.text) return;
@@ -69,27 +101,49 @@ async function handleMessage(event, pageId, senderId, io) {
 
     // Check/create conversation
     const convResult = await query(
-      `SELECT id FROM conversations WHERE "customerId" = $1 AND "pageId" = $2 LIMIT 1`,
+      `SELECT id, "customerName", "customerAvatar" FROM conversations WHERE "customerId" = $1 AND "pageId" = $2 LIMIT 1`,
       [senderId, pageId]
     );
 
     let conversationId;
+    let customerName = `User ${senderId.substring(0, 8)}`;
+    let customerAvatar = '';
 
     if (convResult.rows.length === 0) {
+      // New conversation — fetch customer profile from Facebook
+      const profile = await fetchCustomerProfile(senderId, pageId);
+      customerName = profile.name;
+      customerAvatar = profile.avatarUrl;
+
       conversationId = `${pageId}_${senderId}`;
       await query(
         `INSERT INTO conversations (id, "pageId", "customerId", "customerName", "customerAvatar", "lastMessage", "lastTimestamp", status, "assignedAgentId", "unreadCount")
-         VALUES ($1, $2, $3, $4, '', $5, $6, 'OPEN', NULL, 1)
-         ON CONFLICT (id) DO UPDATE SET "lastMessage" = $5, "lastTimestamp" = $6, "unreadCount" = conversations."unreadCount" + 1`,
-        [conversationId, pageId, senderId, `User ${senderId.substring(0, 8)}`, messageText, timestamp]
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN', NULL, 1)
+         ON CONFLICT (id) DO UPDATE SET "lastMessage" = $6, "lastTimestamp" = $7, "unreadCount" = conversations."unreadCount" + 1, "customerName" = $4, "customerAvatar" = $5`,
+        [conversationId, pageId, senderId, customerName, customerAvatar, messageText, timestamp]
       );
-      logger.info('New conversation created:', conversationId);
+      logger.info('New conversation created with profile:', conversationId, customerName);
     } else {
       conversationId = convResult.rows[0].id;
-      await query(
-        `UPDATE conversations SET "lastMessage" = $1, "lastTimestamp" = $2, "unreadCount" = "unreadCount" + 1 WHERE id = $3`,
-        [messageText, timestamp, conversationId]
-      );
+      customerName = convResult.rows[0].customerName || customerName;
+      customerAvatar = convResult.rows[0].customerAvatar || '';
+
+      // If avatar is missing, try to fetch it
+      if (!customerAvatar) {
+        const profile = await fetchCustomerProfile(senderId, pageId);
+        customerName = profile.name || customerName;
+        customerAvatar = profile.avatarUrl;
+
+        await query(
+          `UPDATE conversations SET "lastMessage" = $1, "lastTimestamp" = $2, "unreadCount" = "unreadCount" + 1, "customerName" = $3, "customerAvatar" = $4 WHERE id = $5`,
+          [messageText, timestamp, customerName, customerAvatar, conversationId]
+        );
+      } else {
+        await query(
+          `UPDATE conversations SET "lastMessage" = $1, "lastTimestamp" = $2, "unreadCount" = "unreadCount" + 1 WHERE id = $3`,
+          [messageText, timestamp, conversationId]
+        );
+      }
     }
 
     // Store message
@@ -97,14 +151,14 @@ async function handleMessage(event, pageId, senderId, io) {
       `INSERT INTO messages (id, "conversationId", "senderId", "senderName", text, timestamp, "isIncoming", "isRead")
        VALUES ($1, $2, $3, $4, $5, $6, true, false)
        ON CONFLICT (id) DO NOTHING`,
-      [messageId, conversationId, senderId, `User ${senderId.substring(0, 8)}`, messageText, timestamp]
+      [messageId, conversationId, senderId, customerName, messageText, timestamp]
     );
 
     const newMessage = {
       id: messageId,
       conversationId,
       senderId,
-      senderName: `User ${senderId.substring(0, 8)}`,
+      senderName: customerName,
       text: messageText,
       timestamp,
       isIncoming: true,
