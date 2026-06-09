@@ -364,6 +364,12 @@ router.get('/config', (_req, res) => {
  * Profile picture proxy — fetches avatar from Facebook using the page's access token.
  * This avoids the OAuthException that occurs when the frontend tries to fetch
  * profile pictures directly without a token.
+ *
+ * Strategy:
+ * 1. Check DB cache first
+ * 2. Try /{customerId}/picture?access_token=... (direct redirect, works for most apps)
+ * 3. Try /{customerId}?fields=picture.type(large) (requires user_profile or pages_messaging)
+ * 4. Try fetching from the conversation's participants list
  */
 router.get('/profilepic/:customerId', async (req, res) => {
   try {
@@ -374,15 +380,18 @@ router.get('/profilepic/:customerId', async (req, res) => {
       return res.status(400).json({ error: 'pageId query parameter is required' });
     }
 
-    // First check if we already have a cached avatar URL in the conversations table
+    // 1. First check if we already have a cached avatar URL in the conversations table
     const cachedResult = await query(
       `SELECT "customerAvatar" FROM conversations WHERE "customerId" = $1 AND "pageId" = $2 AND "customerAvatar" IS NOT NULL AND "customerAvatar" != '' LIMIT 1`,
       [customerId, pageId]
     );
 
     if (cachedResult.rows.length > 0 && cachedResult.rows[0].customerAvatar) {
-      // Redirect to the cached avatar URL
-      return res.redirect(cachedResult.rows[0].customerAvatar);
+      const cachedUrl = cachedResult.rows[0].customerAvatar;
+      // Verify the cached URL is not a broken graph.facebook.com direct URL
+      if (!cachedUrl.includes('graph.facebook.com') || cachedUrl.includes('access_token')) {
+        return res.redirect(cachedUrl);
+      }
     }
 
     // Get the page access token
@@ -397,30 +406,87 @@ router.get('/profilepic/:customerId', async (req, res) => {
 
     const token = pageResult.rows[0].accessToken;
 
-    // Fetch profile picture URL from Facebook Graph API
-    const fbUrl = `https://graph.facebook.com/v22.0/${customerId}?fields=picture.type(large)&access_token=${token}`;
-    const fbRes = await fetch(fbUrl);
-    const data = await fbRes.json();
+    // 2. Try the direct picture endpoint with access_token (most reliable for PSIDs)
+    // This endpoint returns a redirect to the actual image, or an error
+    try {
+      const directPicUrl = `https://graph.facebook.com/v22.0/${customerId}/picture?type=large&width=200&height=200&access_token=${token}`;
+      const directRes = await fetch(directPicUrl, { redirect: 'manual' });
 
-    if (data.error) {
-      logger.warn(`Profile pic fetch failed for ${customerId}:`, data.error.message);
-      return res.status(400).json({ error: data.error.message });
+      if (directRes.status === 302 || directRes.status === 301) {
+        const redirectUrl = directRes.headers.get('location');
+        if (redirectUrl && !redirectUrl.includes('static.xx.fbcdn.net/rsrc.php')) {
+          // Valid redirect to a real profile picture (not the default silhouette)
+          // Cache it
+          await query(
+            `UPDATE conversations SET "customerAvatar" = $1 WHERE "customerId" = $2 AND "pageId" = $3`,
+            [redirectUrl, customerId, pageId]
+          );
+          return res.redirect(redirectUrl);
+        }
+      }
+
+      // If we got a 200, it might be the image data directly (follow redirect mode)
+      if (directRes.status === 200) {
+        // Pipe the image directly
+        const contentType = directRes.headers.get('content-type');
+        if (contentType && contentType.startsWith('image/')) {
+          res.set('Content-Type', contentType);
+          res.set('Cache-Control', 'public, max-age=86400');
+          const buffer = await directRes.arrayBuffer();
+          return res.send(Buffer.from(buffer));
+        }
+      }
+    } catch (directErr) {
+      logger.warn(`Direct picture fetch failed for ${customerId}:`, directErr.message);
     }
 
-    const avatarUrl = data.picture?.data?.url;
+    // 3. Try the fields-based approach
+    try {
+      const fbUrl = `https://graph.facebook.com/v22.0/${customerId}?fields=picture.type(large)&access_token=${token}`;
+      const fbRes = await fetch(fbUrl);
+      const data = await fbRes.json();
 
-    if (!avatarUrl) {
-      return res.status(404).json({ error: 'No profile picture available' });
+      if (!data.error && data.picture?.data?.url) {
+        const avatarUrl = data.picture.data.url;
+        // Cache the avatar URL
+        await query(
+          `UPDATE conversations SET "customerAvatar" = $1 WHERE "customerId" = $2 AND "pageId" = $3`,
+          [avatarUrl, customerId, pageId]
+        );
+        return res.redirect(avatarUrl);
+      }
+
+      if (data.error) {
+        logger.warn(`Profile pic fields fetch failed for ${customerId}: [${data.error.code}] ${data.error.message}`);
+      }
+    } catch (fieldsErr) {
+      logger.warn(`Fields-based profile pic fetch failed for ${customerId}:`, fieldsErr.message);
     }
 
-    // Cache the avatar URL in the conversations table for future use
-    await query(
-      `UPDATE conversations SET "customerAvatar" = $1 WHERE "customerId" = $2 AND "pageId" = $3`,
-      [avatarUrl, customerId, pageId]
-    );
+    // 4. Try fetching from the conversation's participants via the conversations API
+    try {
+      const convId = `${pageId}_${customerId}`;
+      const convUrl = `https://graph.facebook.com/v22.0/${convId}?fields=participants{name,picture.type(large)}&access_token=${token}`;
+      const convRes = await fetch(convUrl);
+      const convData = await convRes.json();
 
-    // Redirect to the actual image URL
-    res.redirect(avatarUrl);
+      if (!convData.error && convData.participants?.data) {
+        const customer = convData.participants.data.find(p => p.id !== pageId);
+        if (customer?.picture?.data?.url) {
+          const avatarUrl = customer.picture.data.url;
+          await query(
+            `UPDATE conversations SET "customerAvatar" = $1 WHERE "customerId" = $2 AND "pageId" = $3`,
+            [avatarUrl, customerId, pageId]
+          );
+          return res.redirect(avatarUrl);
+        }
+      }
+    } catch (convErr) {
+      logger.warn(`Conversation participants fetch failed for ${customerId}:`, convErr.message);
+    }
+
+    // All methods failed — return 404
+    return res.status(404).json({ error: 'Could not fetch profile picture. The app may need pages_user_profile permission.' });
   } catch (error) {
     logger.error('Error fetching profile pic:', error);
     res.status(500).json({ error: error.message });
@@ -429,16 +495,17 @@ router.get('/profilepic/:customerId', async (req, res) => {
 
 /**
  * Refresh avatars for conversations with missing profile pictures.
- * Fetches fresh avatar URLs from Facebook Graph API using page access tokens.
+ * Uses multiple strategies to fetch avatar URLs from Facebook.
  */
 router.post('/refresh-avatars', async (req, res) => {
   try {
-    // Find conversations with empty or null customerAvatar
+    // Find conversations with empty or null customerAvatar (or broken direct FB URLs)
     const result = await query(
       `SELECT c.id, c."customerId", c."pageId", c."customerName", p."accessToken"
        FROM conversations c
        JOIN pages p ON c."pageId" = p.id
-       WHERE (c."customerAvatar" IS NULL OR c."customerAvatar" = '')
+       WHERE (c."customerAvatar" IS NULL OR c."customerAvatar" = '' 
+              OR (c."customerAvatar" LIKE '%graph.facebook.com%' AND c."customerAvatar" NOT LIKE '%access_token%'))
        AND p."accessToken" IS NOT NULL
        LIMIT 50`
     );
@@ -451,17 +518,61 @@ router.post('/refresh-avatars', async (req, res) => {
 
     for (const row of result.rows) {
       try {
-        const url = `https://graph.facebook.com/v22.0/${row.customerId}?fields=name,picture.type(large)&access_token=${row.accessToken}`;
-        const fbRes = await fetch(url);
-        const data = await fbRes.json();
+        let avatarUrl = '';
+        let customerName = row.customerName;
 
-        if (data.error) {
-          logger.warn(`Avatar refresh failed for ${row.customerId}:`, data.error.message);
-          continue;
+        // Strategy 1: Try direct picture endpoint with token (most reliable for PSIDs)
+        try {
+          const directPicUrl = `https://graph.facebook.com/v22.0/${row.customerId}/picture?type=large&width=200&height=200&access_token=${row.accessToken}`;
+          const directRes = await fetch(directPicUrl, { redirect: 'manual' });
+
+          if (directRes.status === 302 || directRes.status === 301) {
+            const redirectUrl = directRes.headers.get('location');
+            if (redirectUrl && !redirectUrl.includes('static.xx.fbcdn.net/rsrc.php')) {
+              avatarUrl = redirectUrl;
+            }
+          }
+        } catch (e) {
+          // Silent, try next strategy
         }
 
-        const avatarUrl = data.picture?.data?.url || '';
-        const customerName = data.name || row.customerName;
+        // Strategy 2: Try fields-based approach
+        if (!avatarUrl) {
+          try {
+            const url = `https://graph.facebook.com/v22.0/${row.customerId}?fields=name,picture.type(large)&access_token=${row.accessToken}`;
+            const fbRes = await fetch(url);
+            const data = await fbRes.json();
+
+            if (!data.error) {
+              avatarUrl = data.picture?.data?.url || '';
+              customerName = data.name || row.customerName;
+            } else {
+              logger.warn(`Avatar refresh (fields) failed for ${row.customerId}: [${data.error.code}] ${data.error.message}`);
+            }
+          } catch (e) {
+            // Silent, try next strategy
+          }
+        }
+
+        // Strategy 3: Try conversation participants API
+        if (!avatarUrl) {
+          try {
+            const convId = `${row.pageId}_${row.customerId}`;
+            const convUrl = `https://graph.facebook.com/v22.0/${convId}?fields=participants{name,picture.type(large)}&access_token=${row.accessToken}`;
+            const convRes = await fetch(convUrl);
+            const convData = await convRes.json();
+
+            if (!convData.error && convData.participants?.data) {
+              const customer = convData.participants.data.find(p => p.id !== row.pageId);
+              if (customer?.picture?.data?.url) {
+                avatarUrl = customer.picture.data.url;
+                customerName = customer.name || customerName;
+              }
+            }
+          } catch (e) {
+            // Silent
+          }
+        }
 
         if (avatarUrl) {
           await query(
