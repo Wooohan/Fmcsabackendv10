@@ -361,6 +361,73 @@ router.get('/config', (_req, res) => {
 });
 
 /**
+ * Profile picture proxy — fetches avatar from Facebook using the page's access token.
+ * This avoids the OAuthException that occurs when the frontend tries to fetch
+ * profile pictures directly without a token.
+ */
+router.get('/profilepic/:customerId', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { pageId } = req.query;
+
+    if (!pageId) {
+      return res.status(400).json({ error: 'pageId query parameter is required' });
+    }
+
+    // First check if we already have a cached avatar URL in the conversations table
+    const cachedResult = await query(
+      `SELECT "customerAvatar" FROM conversations WHERE "customerId" = $1 AND "pageId" = $2 AND "customerAvatar" IS NOT NULL AND "customerAvatar" != '' LIMIT 1`,
+      [customerId, pageId]
+    );
+
+    if (cachedResult.rows.length > 0 && cachedResult.rows[0].customerAvatar) {
+      // Redirect to the cached avatar URL
+      return res.redirect(cachedResult.rows[0].customerAvatar);
+    }
+
+    // Get the page access token
+    const pageResult = await query(
+      `SELECT "accessToken" FROM pages WHERE id = $1`,
+      [pageId]
+    );
+
+    if (!pageResult.rows.length || !pageResult.rows[0].accessToken) {
+      return res.status(404).json({ error: 'Page token not found' });
+    }
+
+    const token = pageResult.rows[0].accessToken;
+
+    // Fetch profile picture URL from Facebook Graph API
+    const fbUrl = `https://graph.facebook.com/v22.0/${customerId}?fields=picture.type(large)&access_token=${token}`;
+    const fbRes = await fetch(fbUrl);
+    const data = await fbRes.json();
+
+    if (data.error) {
+      logger.warn(`Profile pic fetch failed for ${customerId}:`, data.error.message);
+      return res.status(400).json({ error: data.error.message });
+    }
+
+    const avatarUrl = data.picture?.data?.url;
+
+    if (!avatarUrl) {
+      return res.status(404).json({ error: 'No profile picture available' });
+    }
+
+    // Cache the avatar URL in the conversations table for future use
+    await query(
+      `UPDATE conversations SET "customerAvatar" = $1 WHERE "customerId" = $2 AND "pageId" = $3`,
+      [avatarUrl, customerId, pageId]
+    );
+
+    // Redirect to the actual image URL
+    res.redirect(avatarUrl);
+  } catch (error) {
+    logger.error('Error fetching profile pic:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Refresh avatars for conversations with missing profile pictures.
  * Fetches fresh avatar URLs from Facebook Graph API using page access tokens.
  */
