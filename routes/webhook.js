@@ -144,9 +144,26 @@ async function handleRead(event) {
   const watermark = event.read?.watermark;
   if (watermark) {
     try {
+      const watermarkTime = new Date(watermark).toISOString();
+      
+      // Mark messages as read
       await query(
         `UPDATE messages SET "isRead" = true WHERE timestamp <= $1 AND "isRead" = false`,
-        [new Date(watermark).toISOString()]
+        [watermarkTime]
+      );
+      
+      // Reset conversation unread count for conversations with all messages read
+      await query(
+        `UPDATE conversations SET "unreadCount" = 0 
+         WHERE id IN (
+           SELECT DISTINCT c.id FROM conversations c
+           WHERE NOT EXISTS (
+             SELECT 1 FROM messages m 
+             WHERE m."conversationId" = c.id 
+             AND m."isIncoming" = true 
+             AND m."isRead" = false
+           )
+         )`
       );
     } catch (error) {
       logger.error('Error updating read status:', error);
