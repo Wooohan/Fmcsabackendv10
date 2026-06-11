@@ -1,8 +1,6 @@
 import express from 'express';
 import { query } from '../services/db.js';
 import logger from '../utils/logger.js';
-import fetch from 'node-fetch';
-import { sendImageMessage } from '../services/facebookService.js';
 
 const router = express.Router();
 
@@ -20,6 +18,7 @@ router.post('/db', async (req, res) => {
         const probe = await query('SELECT 1');
         return res.json({ ok: true, status: 200, schemaReady: true, details: 'Handshake successful' });
       }
+
       case 'find': {
         let sql, params;
         if (filter?.id) {
@@ -32,6 +31,7 @@ router.post('/db', async (req, res) => {
         const result = await query(sql, params);
         return res.json({ documents: result.rows });
       }
+
       case 'updateOne': {
         const payload = update?.$set || {};
         if (!payload.id) {
@@ -40,8 +40,8 @@ router.post('/db', async (req, res) => {
 
         // JSONB columns that need explicit JSON.stringify + cast
         const jsonbColumns = new Set(['assignedPageIds', 'assignedAgentIds']);
-        const columns = Object.keys(payload);
 
+        const columns = Object.keys(payload);
         // Serialize arrays/objects for JSONB columns so node-pg doesn't
         // convert them to PostgreSQL array literals
         const values = columns.map((col) => {
@@ -58,7 +58,6 @@ router.post('/db', async (req, res) => {
           if (jsonbColumns.has(col)) return `$${i + 1}::jsonb`;
           return `$${i + 1}`;
         });
-
         const updateSet = columns.map((col, i) => {
           if (jsonbColumns.has(col)) return `"${col}" = $${i + 1}::jsonb`;
           return `"${col}" = $${i + 1}`;
@@ -74,6 +73,7 @@ router.post('/db', async (req, res) => {
         const result = await query(sql, values);
         return res.json({ ok: true, upsertedId: result.rows[0]?.id });
       }
+
       case 'deleteOne': {
         if (!filter?.id) {
           return res.status(400).json({ error: 'Missing filter.id' });
@@ -81,10 +81,12 @@ router.post('/db', async (req, res) => {
         await query(`DELETE FROM "${table}" WHERE id = $1`, [filter.id]);
         return res.json({ ok: true });
       }
+
       case 'deleteMany': {
         await query(`DELETE FROM "${table}"`);
         return res.json({ ok: true });
       }
+
       case 'listCollections': {
         const tables = ['agents', 'pages', 'conversations', 'messages', 'links', 'media', 'provisioning_logs'];
         const stats = await Promise.all(
@@ -99,6 +101,7 @@ router.post('/db', async (req, res) => {
         );
         return res.json({ ok: true, collections: stats });
       }
+
       default:
         return res.status(400).json({ error: 'Invalid operation' });
     }
@@ -186,25 +189,20 @@ router.post('/send-message', async (req, res) => {
     let fbResponse = null;
     if (customerId && pageAccessToken) {
       try {
-        const isImage = text.startsWith('data:image/');
-        if (isImage) {
-          fbResponse = await sendImageMessage(customerId, text, pageAccessToken, isWindowExpired);
-        } else {
-          const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${pageAccessToken}`;
-          const payload = {
-            recipient: { id: customerId },
-            message: { text },
-            messaging_type: isWindowExpired ? 'MESSAGE_TAG' : 'RESPONSE',
-          };
-          if (isWindowExpired) payload.tag = 'HUMAN_AGENT';
+        const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${pageAccessToken}`;
+        const payload = {
+          recipient: { id: customerId },
+          message: { text },
+          messaging_type: isWindowExpired ? 'MESSAGE_TAG' : 'RESPONSE',
+        };
+        if (isWindowExpired) payload.tag = 'HUMAN_AGENT';
 
-          const fbRes = await fetch(fbUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-          fbResponse = await fbRes.json();
-        }
+        const fbRes = await fetch(fbUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        fbResponse = await fbRes.json();
 
         if (fbResponse.error) {
           logger.error('Facebook send error:', fbResponse.error);
@@ -241,12 +239,10 @@ router.patch('/conversations/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const updates = req.body;
-
     const keys = Object.keys(updates);
     const values = Object.values(updates);
 
     const setClause = keys.map((k, i) => `"${k}" = $${i + 2}`).join(', ');
-
     const result = await query(
       `UPDATE conversations SET ${setClause} WHERE id = $1 RETURNING *`,
       [id, ...values]
@@ -273,7 +269,6 @@ router.patch('/conversations/:id', async (req, res) => {
 router.post('/subscribe-page', async (req, res) => {
   try {
     const { pageId, accessToken } = req.body;
-
     if (!pageId || !accessToken) {
       return res.status(400).json({ error: 'pageId and accessToken are required' });
     }
@@ -289,7 +284,6 @@ router.post('/subscribe-page', async (req, res) => {
         }),
       }
     );
-
     const data = await fbRes.json();
 
     if (data.success) {
@@ -317,7 +311,6 @@ router.post('/fb/exchange-token', async (req, res) => {
   if (!appId || !appSecret) {
     return res.status(500).json({ error: 'FB_APP_ID or FB_APP_SECRET not configured on server' });
   }
-
   if (!shortLivedToken) {
     return res.status(400).json({ error: 'shortLivedToken is required' });
   }
@@ -347,7 +340,6 @@ router.post('/fb/exchange-token', async (req, res) => {
     }
 
     logger.info(`Token exchange successful. Retrieved ${pagesData.data?.length || 0} pages with permanent tokens.`);
-
     res.json({
       pages: pagesData.data || [],
       longLivedUserToken,
@@ -374,27 +366,28 @@ router.get('/config', (_req, res) => {
 router.post('/conversations/:id/mark-read', async (req, res) => {
   try {
     const { id } = req.params;
-
+    
     // Mark all unread incoming messages in this conversation as read
     await query(
-      `UPDATE messages SET "isRead" = true WHERE "conversationId" = $1 AND "isIncoming" = true AND "isRead" = false`,
+      `UPDATE messages SET "isRead" = true 
+       WHERE "conversationId" = $1 AND "isIncoming" = true AND "isRead" = false`,
       [id]
     );
-
+    
     // Reset conversation unread count
     await query(
       `UPDATE conversations SET "unreadCount" = 0 WHERE id = $1`,
       [id]
     );
-
+    
     // Fetch updated conversation
     const result = await query(`SELECT * FROM conversations WHERE id = $1`, [id]);
-
+    
     // Emit via Socket.IO
     if (req.io && result.rows.length > 0) {
       req.io.emit('conversation_updated', result.rows[0]);
     }
-
+    
     res.json({ ok: true, conversation: result.rows[0] });
   } catch (error) {
     logger.error('Error marking conversation as read:', error);
