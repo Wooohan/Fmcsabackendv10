@@ -361,6 +361,41 @@ router.get('/config', (_req, res) => {
 });
 
 /**
+ * Mark conversation as read (when user opens the chat)
+ */
+router.post('/conversations/:id/mark-read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Mark all unread incoming messages in this conversation as read
+    await query(
+      `UPDATE messages SET "isRead" = true 
+       WHERE "conversationId" = $1 AND "isIncoming" = true AND "isRead" = false`,
+      [id]
+    );
+    
+    // Reset conversation unread count
+    await query(
+      `UPDATE conversations SET "unreadCount" = 0 WHERE id = $1`,
+      [id]
+    );
+    
+    // Fetch updated conversation
+    const result = await query(`SELECT * FROM conversations WHERE id = $1`, [id]);
+    
+    // Emit via Socket.IO
+    if (req.io && result.rows.length > 0) {
+      req.io.emit('conversation_updated', result.rows[0]);
+    }
+    
+    res.json({ ok: true, conversation: result.rows[0] });
+  } catch (error) {
+    logger.error('Error marking conversation as read:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * API health check
  */
 router.get('/health', (_req, res) => {
