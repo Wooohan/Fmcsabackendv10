@@ -84,6 +84,34 @@ CREATE TABLE IF NOT EXISTS provisioning_logs (
     timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Campaigns table
+CREATE TABLE IF NOT EXISTS campaigns (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    message TEXT NOT NULL,
+    delay_seconds INTEGER DEFAULT 3,
+    total_contacts INTEGER DEFAULT 0,
+    sent_count INTEGER DEFAULT 0,
+    failed_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Campaign messages table (tracks individual sends)
+CREATE TABLE IF NOT EXISTS campaign_messages (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    customer_name TEXT NOT NULL,
+    page_id TEXT NOT NULL,
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+    error_message TEXT,
+    sent_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Performance indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_page_timestamp
     ON conversations("pageId", "lastTimestamp" DESC);
@@ -118,6 +146,18 @@ CREATE INDEX IF NOT EXISTS idx_pages_connected
     ON pages("isConnected")
     WHERE "isConnected" = true;
 
+CREATE INDEX IF NOT EXISTS idx_campaigns_status
+    ON campaigns(status);
+
+CREATE INDEX IF NOT EXISTS idx_campaigns_created
+    ON campaigns(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_messages_campaign
+    ON campaign_messages(campaign_id);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_messages_status
+    ON campaign_messages(campaign_id, status);
+
 -- Auto-update timestamp trigger
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -146,6 +186,14 @@ END $$;
 DO $$ BEGIN
     CREATE TRIGGER update_conversations_updated_at
         BEFORE UPDATE ON conversations
+        FOR EACH ROW
+        EXECUTE FUNCTION update_updated_at_column();
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    CREATE TRIGGER update_campaigns_updated_at
+        BEFORE UPDATE ON campaigns
         FOR EACH ROW
         EXECUTE FUNCTION update_updated_at_column();
 EXCEPTION WHEN duplicate_object THEN NULL;
