@@ -402,4 +402,236 @@ router.get('/health', (_req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// CAMPAIGN ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Start a new campaign — creates campaign record and begins async sending
+ */
+router.post('/campaigns/start', async (req, res) => {
+  try {
+    const { name, message, delay, contacts } = req.body;
+
+    if (!name || !message || !contacts || contacts.length === 0) {
+      return res.status(400).json({ error: 'name, message, and contacts are required' });
+    }
+
+    const campaignId = `camp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const delaySeconds = Math.max(1, Math.min(30, delay || 3));
+
+    // Create campaign record
+    await query(
+      `INSERT INTO campaigns (id, name, message, delay_seconds, total_contacts, sent_count, failed_count, status)
+       VALUES ($1, $2, $3, $4, $5, 0, 0, 'running')`,
+      [campaignId, name, message, delaySeconds, contacts.length]
+    );
+
+    // Create campaign_messages records
+    for (const contact of contacts) {
+      const msgId = `cmsg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      await query(
+        `INSERT INTO campaign_messages (id, campaign_id, conversation_id, customer_id, customer_name, page_id, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [msgId, campaignId, contact.id, contact.customerId, contact.customerName, contact.pageId]
+      );
+    }
+
+    logger.info(`Campaign ${campaignId} created: "${name}" with ${contacts.length} contacts, ${delaySeconds}s delay`);
+
+    // Start async sending process
+    processCampaign(campaignId, message, delaySeconds, contacts, req.io);
+
+    res.json({ ok: true, campaignId });
+  } catch (error) {
+    logger.error('Error starting campaign:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Get campaign history
+ */
+router.get('/campaigns/history', async (_req, res) => {
+  try {
+    const result = await query(
+      `SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 50`
+    );
+    res.json({ campaigns: result.rows });
+  } catch (error) {
+    logger.error('Error fetching campaign history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Get campaign details by ID
+ */
+router.get('/campaigns/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaignResult = await query(`SELECT * FROM campaigns WHERE id = $1`, [id]);
+    
+    if (campaignResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    const messagesResult = await query(
+      `SELECT * FROM campaign_messages WHERE campaign_id = $1 ORDER BY created_at ASC`,
+      [id]
+    );
+
+    res.json({
+      campaign: campaignResult.rows[0],
+      messages: messagesResult.rows,
+    });
+  } catch (error) {
+    logger.error('Error fetching campaign details:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Cancel a running campaign
+ */
+router.post('/campaigns/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await query(
+      `UPDATE campaigns SET status = 'cancelled' WHERE id = $1 AND status = 'running'`,
+      [id]
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    logger.error('Error cancelling campaign:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Async campaign processor — sends messages with delays
+ */
+async function processCampaign(campaignId, message, delaySeconds, contacts, io) {
+  let sent = 0;
+  let failed = 0;
+  const total = contacts.length;
+
+  for (let i = 0; i < contacts.length; i++) {
+    // Check if campaign was cancelled
+    const statusCheck = await query(`SELECT status FROM campaigns WHERE id = $1`, [campaignId]);
+    if (statusCheck.rows.length === 0 || statusCheck.rows[0].status === 'cancelled') {
+      logger.info(`Campaign ${campaignId} was cancelled`);
+      break;
+    }
+
+    const contact = contacts[i];
+
+    try {
+      // Get page access token
+      const pageResult = await query(`SELECT "accessToken" FROM pages WHERE id = $1`, [contact.pageId]);
+      
+      if (pageResult.rows.length === 0 || !pageResult.rows[0].accessToken) {
+        throw new Error(`No access token found for page ${contact.pageId}`);
+      }
+
+      const accessToken = pageResult.rows[0].accessToken;
+
+      // Send via Facebook Graph API
+      const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${accessToken}`;
+      const fbPayload = {
+        recipient: { id: contact.customerId },
+        message: { text: message },
+        messaging_type: 'MESSAGE_TAG',
+        tag: 'HUMAN_AGENT',
+      };
+
+      const fbRes = await fetch(fbUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fbPayload),
+      });
+      const fbData = await fbRes.json();
+
+      if (fbData.error) {
+        throw new Error(fbData.error.message || 'Facebook API error');
+      }
+
+      // Mark as sent
+      sent++;
+      await query(
+        `UPDATE campaign_messages SET status = 'sent', sent_at = NOW() 
+         WHERE campaign_id = $1 AND customer_id = $2`,
+        [campaignId, contact.customerId]
+      );
+
+      // Also store as a regular message in the conversation
+      const msgId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const timestamp = new Date().toISOString();
+      await query(
+        `INSERT INTO messages (id, "conversationId", "senderId", "senderName", text, timestamp, "isIncoming", "isRead")
+         VALUES ($1, $2, 'campaign', 'Campaign', $3, $4, false, true)`,
+        [msgId, contact.id, message, timestamp]
+      );
+
+      // Update conversation last message
+      await query(
+        `UPDATE conversations SET "lastMessage" = $1, "lastTimestamp" = $2 WHERE id = $3`,
+        [message, timestamp, contact.id]
+      );
+
+    } catch (err) {
+      failed++;
+      logger.error(`Campaign ${campaignId} - Failed to send to ${contact.customerName}:`, err.message);
+      
+      await query(
+        `UPDATE campaign_messages SET status = 'failed', error_message = $1 
+         WHERE campaign_id = $2 AND customer_id = $3`,
+        [err.message, campaignId, contact.customerId]
+      );
+    }
+
+    // Update campaign counts
+    await query(
+      `UPDATE campaigns SET sent_count = $1, failed_count = $2 WHERE id = $3`,
+      [sent, failed, campaignId]
+    );
+
+    // Emit progress via Socket.IO
+    if (io) {
+      io.emit('campaign_progress', {
+        campaignId,
+        sent,
+        failed,
+        total,
+        currentContact: contact.customerName,
+      });
+    }
+
+    // Delay before next message (skip delay after last message)
+    if (i < contacts.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+    }
+  }
+
+  // Mark campaign as completed
+  const finalStatus = failed === total ? 'failed' : 'completed';
+  await query(
+    `UPDATE campaigns SET status = $1, sent_count = $2, failed_count = $3 WHERE id = $4`,
+    [finalStatus, sent, failed, campaignId]
+  );
+
+  // Emit completion event
+  if (io) {
+    io.emit('campaign_complete', {
+      campaignId,
+      sent,
+      failed,
+      total,
+      status: finalStatus,
+    });
+  }
+
+  logger.info(`Campaign ${campaignId} completed: ${sent} sent, ${failed} failed out of ${total}`);
+}
+
 export default router;
