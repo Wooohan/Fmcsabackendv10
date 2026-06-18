@@ -5,7 +5,7 @@ import logger from '../utils/logger.js';
 const router = express.Router();
 
 /**
- * Generic CRUD relay — replaces the old Vercel serverless /api/db endpoint.
+ * Generic CRUD relay — replaces the old Vercel serverless /api/db endpoint using human tag for chat window.
  * The frontend sends { action, collection, filter?, update? }.
  */
 router.post('/db', async (req, res) => {
@@ -193,9 +193,9 @@ router.post('/send-message', async (req, res) => {
         const payload = {
           recipient: { id: customerId },
           message: { text },
-          messaging_type: isWindowExpired ? 'MESSAGE_TAG' : 'RESPONSE',
+          messaging_type: 'MESSAGE_TAG',
+          tag: 'HUMAN_AGENT',
         };
-        if (isWindowExpired) payload.tag = 'HUMAN_AGENT';
 
         const fbRes = await fetch(fbUrl, {
           method: 'POST',
