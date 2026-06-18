@@ -98,6 +98,63 @@ CREATE TABLE IF NOT EXISTS campaigns (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Safely add columns if campaigns table already existed without them
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN delay_seconds INTEGER DEFAULT 3;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN total_contacts INTEGER DEFAULT 0;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN sent_count INTEGER DEFAULT 0;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN failed_count INTEGER DEFAULT 0;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN status TEXT DEFAULT 'running';
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaigns ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- Fix CHECK constraint on campaigns.status to allow all required values
+DO $$ BEGIN
+    ALTER TABLE campaigns DROP CONSTRAINT IF EXISTS campaigns_status_check;
+EXCEPTION WHEN undefined_object THEN NULL;
+END $$;
+
+ALTER TABLE campaigns ADD CONSTRAINT campaigns_status_check
+    CHECK (status IN ('running', 'completed', 'failed', 'cancelled'));
+
+-- Fix CHECK constraint on campaign_messages.status
+DO $$ BEGIN
+    ALTER TABLE campaign_messages DROP CONSTRAINT IF EXISTS campaign_messages_status_check;
+EXCEPTION WHEN undefined_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE campaign_messages ADD CONSTRAINT campaign_messages_status_check
+        CHECK (status IN ('pending', 'sent', 'failed'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- Campaign messages table (tracks individual sends)
 CREATE TABLE IF NOT EXISTS campaign_messages (
     id TEXT PRIMARY KEY,
