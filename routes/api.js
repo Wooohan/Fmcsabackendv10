@@ -632,6 +632,7 @@ async function processCampaign(campaignId, message, delaySeconds, contacts, io, 
       logger.info(`[CAMPAIGN DEBUG] Found page "${pageName}" with token (length: ${accessToken.length})`);
 
       // Build the Facebook Send API payload per Meta's documentation:
+      // CRITICAL: messaging_type MUST be included at top level
       // messaging_type: MESSAGE_TAG
       // tag: ACCOUNT_UPDATE | POST_PURCHASE_UPDATE | CONFIRMED_EVENT_UPDATE
       const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${accessToken}`;
@@ -643,8 +644,8 @@ async function processCampaign(campaignId, message, delaySeconds, contacts, io, 
       };
 
       logger.info(`[CAMPAIGN DEBUG] Sending to Facebook API:`);
-      logger.info(`[CAMPAIGN DEBUG]   URL: https://graph.facebook.com/v22.0/me/messages?access_token=<REDACTED>`);
-      logger.info(`[CAMPAIGN DEBUG]   Payload: ${JSON.stringify(fbPayload, null, 2)}`);
+      logger.info(`[CAMPAIGN DEBUG]   URL: https://graph.facebook.com/v22.0/me/messages`);
+      logger.info(`[CAMPAIGN DEBUG]   Full Payload: ${JSON.stringify(fbPayload)}`);
 
       const fbRes = await fetch(fbUrl, {
         method: 'POST',
