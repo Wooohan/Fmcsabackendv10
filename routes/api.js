@@ -194,7 +194,7 @@ router.post('/send-message', async (req, res) => {
           recipient: { id: customerId },
           message: { text },
           messaging_type: 'MESSAGE_TAG',
-          tag: 'ACCOUNT_UPDATE',
+          tag: 'HUMAN_AGENT',
         };
 
         const fbRes = await fetch(fbUrl, {
@@ -411,15 +411,11 @@ router.get('/health', (_req, res) => {
  */
 router.post('/campaigns/start', async (req, res) => {
   try {
-    const { name, message, delay, tag, contacts } = req.body;
+    const { name, message, delay, contacts } = req.body;
 
     if (!name || !message || !contacts || contacts.length === 0) {
       return res.status(400).json({ error: 'name, message, and contacts are required' });
     }
-
-    // Validate tag — must be one of the allowed Meta message tags
-    const allowedTags = ['ACCOUNT_UPDATE', 'POST_PURCHASE_UPDATE', 'CONFIRMED_EVENT_UPDATE'];
-    const messageTag = allowedTags.includes(tag) ? tag : 'ACCOUNT_UPDATE';
 
     const campaignId = `camp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const delaySeconds = Math.max(1, Math.min(30, delay || 3));
@@ -441,10 +437,10 @@ router.post('/campaigns/start', async (req, res) => {
       );
     }
 
-    logger.info(`Campaign ${campaignId} created: "${name}" with ${contacts.length} contacts, ${delaySeconds}s delay, tag: ${messageTag}`);
+    logger.info(`Campaign ${campaignId} created: "${name}" with ${contacts.length} contacts, ${delaySeconds}s delay`);
 
     // Start async sending process
-    processCampaign(campaignId, message, delaySeconds, contacts, req.io, messageTag);
+    processCampaign(campaignId, message, delaySeconds, contacts, req.io);
 
     res.json({ ok: true, campaignId });
   } catch (error) {
@@ -515,7 +511,7 @@ router.post('/campaigns/:id/cancel', async (req, res) => {
 /**
  * Async campaign processor — sends messages with delays
  */
-async function processCampaign(campaignId, message, delaySeconds, contacts, io, messageTag = 'ACCOUNT_UPDATE') {
+async function processCampaign(campaignId, message, delaySeconds, contacts, io) {
   let sent = 0;
   let failed = 0;
   const total = contacts.length;
@@ -546,7 +542,7 @@ async function processCampaign(campaignId, message, delaySeconds, contacts, io, 
         recipient: { id: contact.customerId },
         message: { text: message },
         messaging_type: 'MESSAGE_TAG',
-        tag: messageTag,
+        tag: 'HUMAN_AGENT',
       };
 
       const fbRes = await fetch(fbUrl, {
