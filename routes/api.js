@@ -194,7 +194,7 @@ router.post('/send-message', async (req, res) => {
           recipient: { id: customerId },
           message: { text },
           messaging_type: 'MESSAGE_TAG',
-          tag: 'HUMAN_AGENT',
+          tag: 'ACCOUNT_UPDATE',
         };
 
         const fbRes = await fetch(fbUrl, {
