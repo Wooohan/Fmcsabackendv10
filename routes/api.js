@@ -194,7 +194,7 @@ router.post('/send-message', async (req, res) => {
           recipient: { id: customerId },
           message: { text },
           messaging_type: 'MESSAGE_TAG',
-          tag: 'ACCOUNT_UPDATE',
+          tag: 'HUMAN_AGENT',
         };
 
         const fbRes = await fetch(fbUrl, {
@@ -411,15 +411,11 @@ router.get('/health', (_req, res) => {
  */
 router.post('/campaigns/start', async (req, res) => {
   try {
-    const { name, message, delay, tag, contacts } = req.body;
+    const { name, message, delay, contacts } = req.body;
 
     if (!name || !message || !contacts || contacts.length === 0) {
       return res.status(400).json({ error: 'name, message, and contacts are required' });
     }
-
-    // Validate tag — must be one of the allowed Meta message tags
-    const allowedTags = ['ACCOUNT_UPDATE', 'POST_PURCHASE_UPDATE', 'CONFIRMED_EVENT_UPDATE'];
-    const messageTag = allowedTags.includes(tag) ? tag : 'ACCOUNT_UPDATE';
 
     const campaignId = `camp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const delaySeconds = Math.max(1, Math.min(30, delay || 3));
@@ -441,11 +437,10 @@ router.post('/campaigns/start', async (req, res) => {
       );
     }
 
-    logger.info(`Campaign ${campaignId} created: "${name}" with ${contacts.length} contacts, ${delaySeconds}s delay, tag: ${messageTag}`);
-    logger.info(`[CAMPAIGN DEBUG] Contacts payload: ${JSON.stringify(contacts.map(c => ({ id: c.id, customerId: c.customerId, customerName: c.customerName, pageId: c.pageId })))}`);
+    logger.info(`Campaign ${campaignId} created: "${name}" with ${contacts.length} contacts, ${delaySeconds}s delay`);
 
     // Start async sending process
-    processCampaign(campaignId, message, delaySeconds, contacts, req.io, messageTag);
+    processCampaign(campaignId, message, delaySeconds, contacts, req.io);
 
     res.json({ ok: true, campaignId });
   } catch (error) {
@@ -497,86 +492,6 @@ router.get('/campaigns/:id', async (req, res) => {
 });
 
 /**
- * Debug endpoint — test sending a single campaign message to one contact
- * Returns the full Facebook API response for debugging
- */
-router.post('/campaigns/debug-send', async (req, res) => {
-  try {
-    const { customerId, pageId, message, tag } = req.body;
-
-    if (!customerId || !pageId || !message) {
-      return res.status(400).json({ error: 'customerId, pageId, and message are required' });
-    }
-
-    const allowedTags = ['ACCOUNT_UPDATE', 'POST_PURCHASE_UPDATE', 'CONFIRMED_EVENT_UPDATE'];
-    const messageTag = allowedTags.includes(tag) ? tag : 'ACCOUNT_UPDATE';
-
-    // Get page access token
-    const pageResult = await query(`SELECT "accessToken", name FROM pages WHERE id = $1`, [pageId]);
-
-    if (pageResult.rows.length === 0) {
-      return res.status(404).json({ error: `Page not found with id: ${pageId}` });
-    }
-    if (!pageResult.rows[0].accessToken) {
-      return res.status(400).json({ error: `Page "${pageResult.rows[0].name}" has no access token` });
-    }
-
-    const accessToken = pageResult.rows[0].accessToken;
-    const pageName = pageResult.rows[0].name;
-
-    // Build payload exactly per Meta's documentation
-    const fbPayload = {
-      recipient: { id: customerId },
-      message: { text: message },
-      messaging_type: 'MESSAGE_TAG',
-      tag: messageTag,
-    };
-
-    const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${accessToken}`;
-
-    logger.info(`[DEBUG-SEND] Testing send to customerId: ${customerId}, page: "${pageName}" (${pageId}), tag: ${messageTag}`);
-    logger.info(`[DEBUG-SEND] Payload: ${JSON.stringify(fbPayload)}`);
-
-    const fbRes = await fetch(fbUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(fbPayload),
-    });
-
-    const fbResponseStatus = fbRes.status;
-    const fbResponseText = await fbRes.text();
-
-    let fbData;
-    try {
-      fbData = JSON.parse(fbResponseText);
-    } catch {
-      fbData = { raw: fbResponseText };
-    }
-
-    logger.info(`[DEBUG-SEND] Response status: ${fbResponseStatus}`);
-    logger.info(`[DEBUG-SEND] Response body: ${fbResponseText}`);
-
-    // Return full debug info
-    res.json({
-      debug: {
-        page: { id: pageId, name: pageName, tokenLength: accessToken.length },
-        recipient: customerId,
-        messageTag,
-        payload: fbPayload,
-        response: {
-          httpStatus: fbResponseStatus,
-          body: fbData,
-        },
-        success: !fbData.error,
-      },
-    });
-  } catch (error) {
-    logger.error('[DEBUG-SEND] Error:', error);
-    res.status(500).json({ error: error.message, stack: error.stack });
-  }
-});
-
-/**
  * Cancel a running campaign
  */
 router.post('/campaigns/:id/cancel', async (req, res) => {
@@ -595,18 +510,11 @@ router.post('/campaigns/:id/cancel', async (req, res) => {
 
 /**
  * Async campaign processor — sends messages with delays
- * Uses MESSAGE_TAG with allowed tags (ACCOUNT_UPDATE, POST_PURCHASE_UPDATE, CONFIRMED_EVENT_UPDATE)
- * to send outside the 24-hour window as per Meta's documentation.
  */
-async function processCampaign(campaignId, message, delaySeconds, contacts, io, messageTag = 'ACCOUNT_UPDATE') {
+async function processCampaign(campaignId, message, delaySeconds, contacts, io) {
   let sent = 0;
   let failed = 0;
   const total = contacts.length;
-
-  logger.info(`[CAMPAIGN DEBUG] Starting campaign ${campaignId}`);
-  logger.info(`[CAMPAIGN DEBUG] Message tag: ${messageTag}`);
-  logger.info(`[CAMPAIGN DEBUG] Total contacts: ${total}`);
-  logger.info(`[CAMPAIGN DEBUG] Delay: ${delaySeconds}s`);
 
   for (let i = 0; i < contacts.length; i++) {
     // Check if campaign was cancelled
@@ -617,63 +525,36 @@ async function processCampaign(campaignId, message, delaySeconds, contacts, io, 
     }
 
     const contact = contacts[i];
-    logger.info(`[CAMPAIGN DEBUG] Processing contact ${i + 1}/${total}: ${contact.customerName} (customerId: ${contact.customerId}, pageId: ${contact.pageId})`);
 
     try {
       // Get page access token
-      const pageResult = await query(`SELECT "accessToken", name FROM pages WHERE id = $1`, [contact.pageId]);
+      const pageResult = await query(`SELECT "accessToken" FROM pages WHERE id = $1`, [contact.pageId]);
       
       if (pageResult.rows.length === 0 || !pageResult.rows[0].accessToken) {
-        throw new Error(`No access token found for page ${contact.pageId}. Page lookup returned ${pageResult.rows.length} rows.`);
+        throw new Error(`No access token found for page ${contact.pageId}`);
       }
 
       const accessToken = pageResult.rows[0].accessToken;
-      const pageName = pageResult.rows[0].name || 'Unknown';
-      logger.info(`[CAMPAIGN DEBUG] Found page "${pageName}" with token (length: ${accessToken.length})`);
 
-      // Build the Facebook Send API payload per Meta's documentation:
-      // CRITICAL: messaging_type MUST be included at top level
-      // messaging_type: MESSAGE_TAG
-      // tag: ACCOUNT_UPDATE | POST_PURCHASE_UPDATE | CONFIRMED_EVENT_UPDATE
+      // Send via Facebook Graph API
       const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${accessToken}`;
       const fbPayload = {
         recipient: { id: contact.customerId },
         message: { text: message },
         messaging_type: 'MESSAGE_TAG',
-        tag: messageTag,
+        tag: 'HUMAN_AGENT',
       };
-
-      logger.info(`[CAMPAIGN DEBUG] Sending to Facebook API:`);
-      logger.info(`[CAMPAIGN DEBUG]   URL: https://graph.facebook.com/v22.0/me/messages`);
-      logger.info(`[CAMPAIGN DEBUG]   Full Payload: ${JSON.stringify(fbPayload)}`);
 
       const fbRes = await fetch(fbUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(fbPayload),
       });
-
-      const fbResponseStatus = fbRes.status;
-      const fbResponseText = await fbRes.text();
-      
-      logger.info(`[CAMPAIGN DEBUG] Facebook API Response Status: ${fbResponseStatus}`);
-      logger.info(`[CAMPAIGN DEBUG] Facebook API Response Body: ${fbResponseText}`);
-
-      let fbData;
-      try {
-        fbData = JSON.parse(fbResponseText);
-      } catch (parseErr) {
-        throw new Error(`Facebook API returned non-JSON response (HTTP ${fbResponseStatus}): ${fbResponseText.substring(0, 500)}`);
-      }
+      const fbData = await fbRes.json();
 
       if (fbData.error) {
-        const errDetail = `Facebook API Error - Code: ${fbData.error.code}, Subcode: ${fbData.error.error_subcode || 'N/A'}, Type: ${fbData.error.type || 'N/A'}, Message: ${fbData.error.message}, FBTrace: ${fbData.error.fbtrace_id || 'N/A'}`;
-        logger.error(`[CAMPAIGN DEBUG] ${errDetail}`);
-        throw new Error(errDetail);
+        throw new Error(fbData.error.message || 'Facebook API error');
       }
-
-      // Success
-      logger.info(`[CAMPAIGN DEBUG] Successfully sent to ${contact.customerName}. FB message_id: ${fbData.message_id || 'N/A'}`);
 
       // Mark as sent
       sent++;
@@ -700,7 +581,7 @@ async function processCampaign(campaignId, message, delaySeconds, contacts, io, 
 
     } catch (err) {
       failed++;
-      logger.error(`[CAMPAIGN DEBUG] Campaign ${campaignId} - FAILED to send to ${contact.customerName}: ${err.message}`);
+      logger.error(`Campaign ${campaignId} - Failed to send to ${contact.customerName}:`, err.message);
       
       await query(
         `UPDATE campaign_messages SET status = 'failed', error_message = $1 
@@ -750,7 +631,7 @@ async function processCampaign(campaignId, message, delaySeconds, contacts, io, 
     });
   }
 
-  logger.info(`[CAMPAIGN DEBUG] Campaign ${campaignId} FINISHED: ${sent} sent, ${failed} failed out of ${total}`);
+  logger.info(`Campaign ${campaignId} completed: ${sent} sent, ${failed} failed out of ${total}`);
 }
 
 export default router;
