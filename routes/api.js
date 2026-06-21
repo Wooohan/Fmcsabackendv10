@@ -396,6 +396,189 @@ router.post('/conversations/:id/mark-read', async (req, res) => {
 });
 
 /**
+ * Dashboard Stats — computed server-side to handle thousands of conversations
+ */
+router.get('/dashboard/stats', async (req, res) => {
+  try {
+    const { agentId, role } = req.query;
+    const isAdmin = role === 'SUPER_ADMIN';
+
+    // Get conversation counts by status (server-side aggregation)
+    let statusCountsQuery;
+    let statusCountsParams = [];
+
+    if (isAdmin) {
+      statusCountsQuery = `
+        SELECT status, COUNT(*) as count, 
+               COALESCE(SUM("unreadCount"), 0) as unread_total
+        FROM conversations 
+        GROUP BY status
+      `;
+    } else {
+      // Agent sees only conversations from pages they're assigned to
+      statusCountsQuery = `
+        SELECT c.status, COUNT(*) as count,
+               COALESCE(SUM(c."unreadCount"), 0) as unread_total
+        FROM conversations c
+        JOIN pages p ON c."pageId" = p.id
+        WHERE p."assignedAgentIds"::jsonb ? $1
+        GROUP BY c.status
+      `;
+      statusCountsParams = [agentId];
+    }
+
+    const statusResult = await query(statusCountsQuery, statusCountsParams);
+
+    let openCount = 0, pendingCount = 0, resolvedCount = 0, unreadTotal = 0;
+    for (const row of statusResult.rows) {
+      const count = parseInt(row.count);
+      const unread = parseInt(row.unread_total);
+      switch (row.status) {
+        case 'OPEN': openCount = count; unreadTotal += unread; break;
+        case 'PENDING': pendingCount = count; unreadTotal += unread; break;
+        case 'RESOLVED': resolvedCount = count; break;
+      }
+    }
+
+    // Get total conversations for this agent
+    let totalConversations;
+    if (isAdmin) {
+      const totalRes = await query(`SELECT COUNT(*) as count FROM conversations`);
+      totalConversations = parseInt(totalRes.rows[0].count);
+    } else {
+      const totalRes = await query(
+        `SELECT COUNT(*) as count FROM conversations c 
+         JOIN pages p ON c."pageId" = p.id 
+         WHERE p."assignedAgentIds"::jsonb ? $1`,
+        [agentId]
+      );
+      totalConversations = parseInt(totalRes.rows[0].count);
+    }
+
+    // Get agent statuses
+    const agentsResult = await query(`SELECT id, name, status, avatar FROM agents`);
+    const onlineAgents = agentsResult.rows.filter(a => a.status === 'online').length;
+    const totalAgents = agentsResult.rows.length;
+
+    // Get connected pages count
+    const pagesResult = await query(`SELECT COUNT(*) as count FROM pages WHERE "isConnected" = true`);
+    const connectedPages = parseInt(pagesResult.rows[0].count);
+    const totalPagesRes = await query(`SELECT COUNT(*) as count FROM pages`);
+    const totalPages = parseInt(totalPagesRes.rows[0].count);
+
+    // Conversation volume chart — last 7 days (server-side aggregation)
+    const chartResult = await query(`
+      SELECT 
+        TO_CHAR(date_trunc('day', "lastTimestamp"), 'Dy') as name,
+        COUNT(*) as conversations
+      FROM conversations
+      WHERE "lastTimestamp" >= NOW() - INTERVAL '7 days'
+      GROUP BY date_trunc('day', "lastTimestamp"), TO_CHAR(date_trunc('day', "lastTimestamp"), 'Dy')
+      ORDER BY date_trunc('day', "lastTimestamp") ASC
+    `);
+    const chartData = chartResult.rows.map(r => ({
+      name: r.name,
+      conversations: parseInt(r.conversations),
+    }));
+
+    // Average response time (compute from messages — time between incoming and next outgoing)
+    const avgResponseResult = await query(`
+      SELECT AVG(response_time) as avg_seconds FROM (
+        SELECT EXTRACT(EPOCH FROM (
+          (SELECT MIN(m2.timestamp) FROM messages m2 
+           WHERE m2."conversationId" = m1."conversationId" 
+           AND m2."isIncoming" = false 
+           AND m2.timestamp > m1.timestamp)
+          - m1.timestamp
+        )) as response_time
+        FROM messages m1
+        WHERE m1."isIncoming" = true
+        AND m1.timestamp >= NOW() - INTERVAL '7 days'
+        LIMIT 500
+      ) sub
+      WHERE response_time IS NOT NULL AND response_time > 0 AND response_time < 86400
+    `);
+
+    let avgResponseTime = 'N/A';
+    const avgSeconds = avgResponseResult.rows[0]?.avg_seconds;
+    if (avgSeconds) {
+      const mins = Math.floor(avgSeconds / 60);
+      const secs = Math.floor(avgSeconds % 60);
+      if (mins >= 60) {
+        avgResponseTime = `${Math.floor(mins / 60)}h ${mins % 60}m`;
+      } else {
+        avgResponseTime = `${mins}m ${secs}s`;
+      }
+    }
+
+    // Needs attention — unread or pending, most recent first (limit 6)
+    let needsAttentionQuery;
+    let needsAttentionParams = [];
+    if (isAdmin) {
+      needsAttentionQuery = `
+        SELECT id, "customerName", "customerAvatar", "lastMessage", "lastTimestamp", "unreadCount", status
+        FROM conversations
+        WHERE "unreadCount" > 0 OR status = 'PENDING'
+        ORDER BY "lastTimestamp" DESC
+        LIMIT 6
+      `;
+    } else {
+      needsAttentionQuery = `
+        SELECT c.id, c."customerName", c."customerAvatar", c."lastMessage", c."lastTimestamp", c."unreadCount", c.status
+        FROM conversations c
+        JOIN pages p ON c."pageId" = p.id
+        WHERE (c."unreadCount" > 0 OR c.status = 'PENDING')
+        AND p."assignedAgentIds"::jsonb ? $1
+        ORDER BY c."lastTimestamp" DESC
+        LIMIT 6
+      `;
+      needsAttentionParams = [agentId];
+    }
+    const needsAttentionResult = await query(needsAttentionQuery, needsAttentionParams);
+
+    // Agent workload (admin only)
+    let agentWorkload = [];
+    if (isAdmin) {
+      const workloadResult = await query(`
+        SELECT 
+          a.id, a.name, a.avatar, a.status,
+          COUNT(CASE WHEN c.status != 'RESOLVED' THEN 1 END) as open_count,
+          COUNT(CASE WHEN c.status = 'RESOLVED' THEN 1 END) as resolved_count
+        FROM agents a
+        LEFT JOIN conversations c ON c."assignedAgentId" = a.id
+        GROUP BY a.id, a.name, a.avatar, a.status
+        ORDER BY COUNT(CASE WHEN c.status != 'RESOLVED' THEN 1 END) DESC
+        LIMIT 5
+      `);
+      agentWorkload = workloadResult.rows.map(r => ({
+        agent: { id: r.id, name: r.name, avatar: r.avatar, status: r.status },
+        openCount: parseInt(r.open_count),
+        resolvedCount: parseInt(r.resolved_count),
+      }));
+    }
+
+    res.json({
+      openCount,
+      pendingCount,
+      resolvedCount,
+      unreadTotal,
+      totalConversations,
+      onlineAgents,
+      totalAgents,
+      connectedPages,
+      totalPages,
+      chartData,
+      avgResponseTime,
+      needsAttention: needsAttentionResult.rows,
+      agentWorkload,
+    });
+  } catch (error) {
+    logger.error('Error fetching dashboard stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * API health check
  */
 router.get('/health', (_req, res) => {
