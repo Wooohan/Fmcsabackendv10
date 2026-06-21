@@ -30,12 +30,58 @@ const io = new SocketIOServer(server, {
   pingTimeout: 5000,
 });
 
-// Track connected clients
+// Track connected agents: Map<socketId, { agentId, agentName }>
+const connectedAgents = new Map();
+
+// Track connected clients + agent online status
 io.on('connection', (socket) => {
   logger.info('Client connected:', socket.id);
 
-  socket.on('disconnect', () => {
+  // Agent identifies themselves after connecting
+  socket.on('agent_online', async (data) => {
+    const { agentId, agentName } = data || {};
+    if (!agentId) return;
+
+    connectedAgents.set(socket.id, { agentId, agentName });
+    logger.info(`Agent online: ${agentName} (${agentId})`);
+
+    // Update agent status in DB
+    try {
+      const { query: dbQuery } = await import('./services/db.js');
+      await dbQuery(`UPDATE agents SET status = 'online' WHERE id = $1`, [agentId]);
+    } catch (e) {
+      logger.warn('Failed to update agent status in DB:', e.message);
+    }
+
+    // Broadcast updated agent statuses to all clients
+    io.emit('agent_status_changed', { agentId, status: 'online' });
+  });
+
+  socket.on('disconnect', async () => {
     logger.info('Client disconnected:', socket.id);
+
+    const agentInfo = connectedAgents.get(socket.id);
+    if (agentInfo) {
+      connectedAgents.delete(socket.id);
+
+      // Check if this agent has other active connections
+      const stillConnected = [...connectedAgents.values()].some(a => a.agentId === agentInfo.agentId);
+
+      if (!stillConnected) {
+        logger.info(`Agent offline: ${agentInfo.agentName} (${agentInfo.agentId})`);
+
+        // Update agent status in DB
+        try {
+          const { query: dbQuery } = await import('./services/db.js');
+          await dbQuery(`UPDATE agents SET status = 'offline' WHERE id = $1`, [agentInfo.agentId]);
+        } catch (e) {
+          logger.warn('Failed to update agent offline status in DB:', e.message);
+        }
+
+        // Broadcast updated agent statuses to all clients
+        io.emit('agent_status_changed', { agentId: agentInfo.agentId, status: 'offline' });
+      }
+    }
   });
 });
 
